@@ -1,26 +1,29 @@
 #!/bin/bash
 #------------------------------------------------------------------------------
-# orin-nano-l4t-prepare-and-flash.sh  (v1.5)
+# orin-nano-l4t-prepare-and-flash.sh  (v1.6)
 #
-# Prepare + flash Jetson Linux (L4T) to NVMe on Jetson Orin Nano from a Fedora host.
+# Prepare and flash Jetson Linux (L4T) to NVMe on Jetson Orin Nano from a
+# Fedora 40 host.
 #
 # Example:
-#     sudo ./orin-nano-l4t-prepare-and-flash.sh -g -v 36.4.4
-#     sudo ./orin-nano-l4t-prepare-and-flash.sh -f
+#   sudo ./orin-nano-l4t-prepare-and-flash.sh -g -v 36.4.4
+#   sudo ./orin-nano-l4t-prepare-and-flash.sh -f
 #
 # Notes:
-# - “Super” (higher clocks/25W) is enabled by JetPack 6.2+/L4T r36.x.
-# - Clean NVMe rootfs via initrd flash (no SD card needed).
-# - If native apply_binaries fails (qemu segfaults on Fedora), it falls back to
-#   an Ubuntu 22.04 container (podman preferred; docker fallback).
-# - Ensures kernel modules exist; if not, extracts NVIDIA kernel debs directly.
-# - Installs a first-boot systemd unit that sets MAXN and runs jetson_clocks.
-# - Uses fixed USB gadget NIC name: --network usb0
+# - "Super" on Orin Nano means higher clocks/bandwidth within Orin Nano’s
+#   15 W envelope on JetPack 6.
+# - Rootfs flashed to NVMe using NVIDIA's initrd-based external storage
+#   workflow; QSPI boot firmware updated on-module; no SD card required.
+# - If native apply_binaries fails, use an Ubuntu 22.04 container.
+# - Ensure kernel modules exist; if not, extract NVIDIA kernel packages.
+# - Install a boot service that selects the highest available nvpmodel
+#   (15 W on Orin Nano) and runs jetson_clocks each boot.
+# - Use USB gadget NIC name "usb0".
 #------------------------------------------------------------------------------
 
 set -euo pipefail
 
-version=1.5
+version=1.6
 
 L4T_DOWNLOADS_URL="https://developer.nvidia.com/downloads/embedded/l4t"
 L4T_DIR="${PWD}/Linux_for_Tegra"
@@ -61,8 +64,8 @@ main () {
         setup_rootfs
         install_rpm_packages_for_flashing
         apply_binaries_portable              # native first; container fallback
-        ensure_kernel_modules_present        # NEW: force-extract kernel debs if needed
-        install_super_boot_unit              # drop in MAXN + jetson_clocks first-boot unit
+        ensure_kernel_modules_present        # force-extract kernel debs if needed
+        install_super_boot_unit              # highest nvpmodel + jetson_clocks each boot
     fi
 
     if [ "$flash_l4t" = true ]; then
@@ -269,11 +272,9 @@ ensure_kernel_modules_present () {
     fi
 
     echo "${YELLOW}Kernel modules missing. Extracting kernel debs directly into rootfs...${NORMAL}"
-    # Remove any partial modules tree
     rm -rf "${LDK_ROOTFS_DIR}/lib/modules" || true
 
     local extracted=0
-    # Find and extract relevant kernel debs from NVIDIA bundle (no chroot, no qemu)
     while IFS= read -r -d '' deb; do
         echo "Extracting $(basename "$deb")"
         dpkg-deb -x "$deb" "${LDK_ROOTFS_DIR}/"
@@ -296,9 +297,9 @@ ensure_kernel_modules_present () {
 
 install_super_boot_unit () {
     echo ""
-    echo "${BOLD}Installing auto-MAXN + jetson_clocks boot service into rootfs...${NORMAL}"
+    echo "${BOLD}Installing performance boot service (highest nvpmodel + jetson_clocks) into rootfs...${NORMAL}"
 
-    # Helper script that runs on the Jetson at first boot
+    # Helper script that runs on the Jetson at boot
     cat > "${LDK_ROOTFS_DIR}/usr/local/sbin/jetson-super-setup.sh" << 'EOS'
 #!/bin/bash
 set -euo pipefail
@@ -308,38 +309,49 @@ echo "[jetson-super-setup] $(date -Is)"
 
 export DEBIAN_FRONTEND=noninteractive
 
-# Ensure nvpmodel + fan control exist
+# Ensure required tools are present
 if ! command -v nvpmodel >/dev/null 2>&1; then
     apt-get update || true
     apt-get install -y nvidia-l4t-nvpmodel nvidia-l4t-nvfancontrol || true
 fi
-
-# Ensure jetson_clocks exists (try common packages; ignore failures)
 if ! command -v jetson_clocks >/dev/null 2>&1; then
     apt-get update || true
-    apt-get install -y nvidia-jetpack || true
-    apt-get install -y nvidia-jetson-utilities || true
     apt-get install -y nvidia-l4t-utils || true
 fi
 
-# Pick a MAXN/25W mode if listed; otherwise highest-numbered mode
-mode_id="$(nvpmodel -q --verbose 2>/dev/null | awk '
-  /Mode [0-9]+/ {id=$2}
-  /MAXN|25W/    {cand=id}
-  END { if (cand!="") print cand }
-')"
-if [ -z "${mode_id:-}" ]; then
-    mode_id="$(nvpmodel -q --verbose 2>/dev/null | awk "/Mode [0-9]+/ {print \$2}" | tail -n1 || true)"
-fi
+# Pick the highest available nvpmodel (by W), fallback to highest Mode ID
+pick_highest_mode() {
+    local line lastID="" bestID="" bestW=0 w id
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*Mode[[:space:]]+([0-9]+) ]]; then
+            id="${BASH_REMATCH[1]}"; lastID="$id"
+            if [[ "$line" =~ ([0-9]+)W ]]; then
+                w="${BASH_REMATCH[1]}"
+                if (( w >= bestW )); then bestW="$w"; bestID="$id"; fi
+            fi
+        elif [[ -n "$lastID" && "$line" =~ ([0-9]+)W ]]; then
+            w="${BASH_REMATCH[1]}"
+            if (( w >= bestW )); then bestW="$w"; bestID="$lastID"; fi
+        fi
+    done < <(nvpmodel -q 2>/dev/null || true)
 
-if [ -n "${mode_id:-}" ]; then
-    echo "Setting nvpmodel to mode ${mode_id}"
-    nvpmodel -m "${mode_id}" || true
+    if [[ -z "$bestID" ]]; then
+        bestID="$(nvpmodel -q --verbose 2>/dev/null | awk "/Mode [0-9]+/ {print \$2}" | tail -n1 || true)"
+    fi
+    echo "$bestID"
+}
+
+target_id="$(pick_highest_mode)"
+echo "target_id=${target_id}"
+
+if [[ -n "${target_id}" ]]; then
+    echo "Setting nvpmodel to mode ${target_id}"
+    nvpmodel -m "${target_id}" || true
 else
     echo "Could not determine nvpmodel mode automatically."
 fi
 
-# Pin clocks within the selected power budget
+# Pin clocks each boot
 if command -v jetson_clocks >/dev/null 2>&1; then
     echo "Running jetson_clocks"
     jetson_clocks || true
@@ -353,7 +365,7 @@ EOS
     mkdir -p "${LDK_ROOTFS_DIR}/etc/systemd/system/multi-user.target.wants"
     cat > "${LDK_ROOTFS_DIR}/etc/systemd/system/jetson-super-setup.service" << 'EOF'
 [Unit]
-Description=Enable Jetson Super (MAXN) and performance tuning at boot
+Description=Enable Jetson Super (highest nvpmodel + performance tuning) at boot
 Wants=network-online.target
 After=network-online.target
 
@@ -426,10 +438,10 @@ flash_nvme_ssd () {
     echo ""
     echo "${GREEN}${BOLD}Flash complete. On first boot from NVMe:${NORMAL}"
     echo "    sudo apt update && sudo apt full-upgrade -y"
-    echo "    # The jetson-super-setup.service will set MAXN and run jetson_clocks"
-    echo "    # Logs: /var/log/jetson-super-setup.log"
+    echo "    # The jetson-super-setup.service will select the highest nvpmodel (15 W on Orin Nano)"
+    echo "    # and run jetson_clocks. Logs: /var/log/jetson-super-setup.log"
     echo "    # Verify:"
-    echo "    which nvpmodel && sudo nvpmodel -q --verbose"
+    echo "    which nvpmodel && sudo nvpmodel -q"
     echo "    sudo tegrastats   # optional: watch clocks/power"
 }
 
